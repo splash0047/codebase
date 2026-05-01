@@ -1,0 +1,78 @@
+.query-panel {
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.intent-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.intent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.intent-chip:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+.intent-chip.active {
+  background: var(--bg-elevated);
+}
+
+.query-form { display: flex; }
+
+.query-input-wrap {
+  display: flex;
+  flex: 1;
+  gap: 10px;
+}
+
+.query-input {
+  flex: 1;
+  font-size: 1rem;
+  padding: 14px 18px;
+}
+
+.query-submit {
+  flex-shrink: 0;
+  padding: 14px 20px;
+}
+.query-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.spin-icon { animation: spin 0.8s linear infinite; }
+
+.stream-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-md);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.stream-dot {
+  width: 10px; height: 10px;
+  background: var(--accent-primary);
+  border-radius: 50%;
+  flex-shrink: 0;
+}
