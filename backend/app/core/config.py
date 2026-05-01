@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     max_nodes_absolute: int = 50
     max_tokens_absolute: int = 4000
     max_retries: int = 3
-    max_traversal_depth: int = 2   # Expanded to depth>2 only in Phase 6
+    max_traversal_depth: int = 5   # Phase 6: Enabled multi-hop reasoning (depth > 2)
     max_top_k: int = 20            # Hard ceiling on dynamic top-K
 
     # Cache Budget

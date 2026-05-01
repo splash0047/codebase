@@ -155,3 +155,26 @@ async def get_query_frequency(fingerprint: str) -> int:
     r = get_redis()
     val = await r.get(f"qfreq:{fingerprint}")
     return int(val) if val else 0
+
+
+# ── Session State Persistence ──────────────────────────────────────────────────
+
+async def save_session(session_id: str, turns: list[dict[str, Any]], ttl_seconds: int = 86400) -> None:
+    """Save session turns to Redis."""
+    r = get_redis()
+    try:
+        await r.setex(f"session:{session_id}", ttl_seconds, json.dumps(turns))
+    except Exception as exc:
+        logger.error("session_save_failed", session_id=session_id, error=str(exc))
+
+
+async def load_session(session_id: str) -> list[dict[str, Any]]:
+    """Load session turns from Redis."""
+    r = get_redis()
+    try:
+        raw = await r.get(f"session:{session_id}")
+        if raw:
+            return json.loads(raw)
+    except Exception as exc:
+        logger.error("session_load_failed", session_id=session_id, error=str(exc))
+    return []

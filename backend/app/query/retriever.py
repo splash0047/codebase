@@ -220,7 +220,7 @@ async def _fallback_hierarchy(
         logger.info("fallback_resolved_symbol", count=len(results))
         return results
 
-    # 2. Graph neighbours (breadth=1)
+    # 2. Graph neighbours (breadth=1 for semantic fallback)
     symbol_hint = query.split()[-1] if query else None
     results = await _graph_search(repo_id, symbol_hint, depth=1, node_limit=10)
     if results:
@@ -325,7 +325,9 @@ class HybridRetriever:
         # ── Graph retrieval (extract likely symbol name from query)
         if use_graph:
             symbol_hint = self._extract_symbol(query)
-            graph_nodes = await _graph_search(repo_id, symbol_hint)
+            # Multi-hop reasoning for complex intents (Phase 6)
+            graph_depth = 5 if intent in (QueryIntent.EXPLANATION, QueryIntent.DEPENDENCY) else 2
+            graph_nodes = await _graph_search(repo_id, symbol_hint, depth=graph_depth)
             nodes.extend(graph_nodes)
 
         # ── Fallback if still empty

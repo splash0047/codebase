@@ -114,7 +114,9 @@ class SessionMemory:
     """
     Stores recent query turns for context continuity.
     Resets if topic changes abruptly (plan: embedding sim + keyword overlap).
+    Now backed by Redis for horizontal scalability.
     """
+    session_id: str = "default"
     turns:     list[SessionTurn] = field(default_factory=list)
     max_turns: int = 5   # Keep last 5 turns
 
@@ -155,13 +157,39 @@ class SessionMemory:
                 "session_context_reset",
                 sim=round(sim, 3),
                 overlap=round(overlap, 3),
+                session_id=self.session_id,
             )
             return True
         return False
 
     def reset(self) -> None:
         self.turns.clear()
-        logger.info("session_reset")
+        logger.info("session_reset", session_id=self.session_id)
+
+    async def load(self) -> None:
+        """Load session state from Redis."""
+        from app.db.redis_client import load_session
+        raw_turns = await load_session(self.session_id)
+        self.turns.clear()
+        for t in raw_turns:
+            # Convert intent string back to enum if necessary
+            intent_val = t.get("intent")
+            if isinstance(intent_val, str):
+                t["intent"] = QueryIntent(intent_val)
+            self.turns.append(SessionTurn(**t))
+
+    async def save(self) -> None:
+        """Save session state to Redis."""
+        from app.db.redis_client import save_session
+        import dataclasses
+        
+        raw_turns = []
+        for t in self.turns:
+            d = dataclasses.asdict(t)
+            d["intent"] = t.intent.value  # Serialize Enum to string
+            raw_turns.append(d)
+            
+        await save_session(self.session_id, raw_turns)
 
     def get_context_window(self) -> list[dict[str, str]]:
         """Return recent turns formatted for LLM context."""

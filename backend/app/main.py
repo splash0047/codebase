@@ -6,14 +6,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from app.core.config import get_settings
 from app.core.logging import get_logger, setup_logging
+from app.core.telemetry import init_telemetry, shutdown_telemetry
+from app.core.metrics import get_metrics_text
 from app.db.neo4j_client import close_neo4j, init_neo4j, run_schema_setup
 from app.db.postgres import create_tables, dispose_engine
 from app.db.redis_client import close_redis, init_redis
-from app.api.routes import ingest, query as query_router
+from app.api.routes import ingest, query as query_router, analysis
 
 settings = get_settings()
 setup_logging()
@@ -27,6 +29,9 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown sequence."""
     logger.info("app_starting", env=settings.app_env)
 
+    # Initialise telemetry
+    init_telemetry()
+
     # Initialise all database connections
     await init_redis()
     await init_neo4j()
@@ -35,11 +40,20 @@ async def lifespan(app: FastAPI):
     if settings.app_env == "development":
         await create_tables()   # Auto-create tables in dev (use Alembic in prod)
 
+    # Auto-instrument FastAPI with OpenTelemetry
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(app)
+        logger.info("otel_fastapi_instrumented")
+    except ImportError:
+        logger.warning("otel_fastapi_instrumentation_unavailable")
+
     logger.info("app_ready")
     yield
 
     # Graceful shutdown
     logger.info("app_shutting_down")
+    shutdown_telemetry()
     await close_redis()
     await close_neo4j()
     await dispose_engine()
@@ -74,6 +88,7 @@ app.add_middleware(
 
 app.include_router(ingest.router, prefix="/api/v1")
 app.include_router(query_router.router, prefix="/api/v1")
+app.include_router(analysis.router, prefix="/api/v1")
 
 
 # ── Health Check ──────────────────────────────────────────────────────────────
@@ -81,7 +96,14 @@ app.include_router(query_router.router, prefix="/api/v1")
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Liveness probe."""
-    return JSONResponse({"status": "ok", "version": "0.1.0"})
+    return JSONResponse({"status": "ok", "version": "0.2.0"})
+
+
+@app.get("/metrics", tags=["Observability"])
+async def prometheus_metrics():
+    """Prometheus metrics endpoint."""
+    body, content_type = get_metrics_text()
+    return Response(content=body, media_type=content_type)
 
 
 @app.get("/ready", tags=["Health"])

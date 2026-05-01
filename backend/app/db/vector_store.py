@@ -213,37 +213,154 @@ class FAISSVectorStore(BaseVectorStore):
         return len(to_remove)
 
 
-# ── Pinecone Vector Store (Production upgrade path) ────────────────────────────
+# ── Pinecone Vector Store (Production) ─────────────────────────────────────────
 
 class PineconeVectorStore(BaseVectorStore):
     """
     Pinecone-backed vector store for production.
-    Uses the pinecone-mcp-server tooling already available.
+    Uses the official pinecone-client SDK.
     Activated by setting VECTOR_STORE=pinecone in env.
+
+    Required env vars:
+      PINECONE_API_KEY    — Pinecone API key
+      PINECONE_INDEX_NAME — Index name (default: codebase-knowledge)
     """
 
     def __init__(self, repo_id: str, namespace: str | None = None):
         self.repo_id   = repo_id
         self.namespace = namespace or repo_id
         self._index_name = os.getenv("PINECONE_INDEX_NAME", "codebase-knowledge")
-        # Client is initialised lazily via mcp tooling
-        logger.info("pinecone_store_init", namespace=self.namespace)
+        self._client = None
+        self._index  = None
+        logger.info("pinecone_store_init", namespace=self.namespace, index=self._index_name)
+
+    def _ensure_client(self):
+        """Lazy-initialise the Pinecone client and index."""
+        if self._index is not None:
+            return
+        try:
+            from pinecone import Pinecone
+
+            api_key = os.getenv("PINECONE_API_KEY", "")
+            if not api_key:
+                raise ValueError("PINECONE_API_KEY not set")
+
+            self._client = Pinecone(api_key=api_key)
+            self._index = self._client.Index(self._index_name)
+            logger.info("pinecone_client_ready", index=self._index_name)
+        except ImportError:
+            logger.error("pinecone_sdk_not_installed")
+            raise
+        except Exception as e:
+            logger.error("pinecone_init_failed", error=str(e))
+            raise
 
     async def upsert(self, records: list[dict[str, Any]]) -> list[str]:
-        # Implemented in Phase 5 using pinecone-mcp-server upsert-records
-        logger.info("pinecone_upsert_stub", count=len(records))
-        return [str(uuid.uuid4()) for _ in records]
+        """
+        Upsert vectors with metadata to Pinecone.
+        Each record must have: vector, chunk_hash, file_path, symbol_name,
+        chunk_type, start_line, end_line.
+        """
+        self._ensure_client()
+
+        vectors = []
+        vid_map = []
+
+        for rec in records:
+            vec = rec.get("vector")
+            if vec is None:
+                continue
+            vector_id = str(uuid.uuid4())
+            metadata = {
+                "chunk_hash":  rec.get("chunk_hash", ""),
+                "file_path":   rec.get("file_path", ""),
+                "symbol_name": rec.get("symbol_name", ""),
+                "chunk_type":  rec.get("chunk_type", ""),
+                "start_line":  rec.get("start_line", 0),
+                "end_line":    rec.get("end_line", 0),
+                "chunk_text":  rec.get("chunk_text", "")[:1000],  # Pinecone metadata limit
+                "repo_id":     self.repo_id,
+            }
+            vectors.append({
+                "id": vector_id,
+                "values": vec,
+                "metadata": metadata,
+            })
+            vid_map.append(vector_id)
+
+        # Batch upsert in chunks of 100 (Pinecone recommended batch size)
+        BATCH_SIZE = 100
+        for i in range(0, len(vectors), BATCH_SIZE):
+            batch = vectors[i:i + BATCH_SIZE]
+            try:
+                self._index.upsert(vectors=batch, namespace=self.namespace)
+            except Exception as e:
+                logger.error("pinecone_upsert_failed", batch=i, error=str(e))
+                raise
+
+        logger.info("pinecone_upserted", count=len(vectors), namespace=self.namespace)
+        return vid_map
 
     async def search(
-        self, query_vector: list[float], top_k: int, filters: dict | None = None
+        self,
+        query_vector: list[float],
+        top_k: int,
+        filters: dict | None = None,
     ) -> list[dict[str, Any]]:
-        # Implemented in Phase 5 using pinecone-mcp-server search-records
-        logger.info("pinecone_search_stub", top_k=top_k)
-        return []
+        """Search Pinecone with optional metadata filtering."""
+        self._ensure_client()
+
+        top_k = min(top_k, settings.max_top_k)
+
+        # Build Pinecone filter
+        pc_filter: dict[str, Any] = {"repo_id": {"$eq": self.repo_id}}
+        if filters and filters.get("file_path"):
+            pc_filter["file_path"] = {"$eq": filters["file_path"]}
+
+        try:
+            response = self._index.query(
+                vector=query_vector,
+                top_k=top_k,
+                namespace=self.namespace,
+                filter=pc_filter,
+                include_metadata=True,
+            )
+        except Exception as e:
+            logger.error("pinecone_search_failed", error=str(e))
+            return []
+
+        results: list[dict[str, Any]] = []
+        for match in response.get("matches", []):
+            meta = match.get("metadata", {})
+            results.append({
+                "vector_id":   match["id"],
+                "score":       float(match.get("score", 0.0)),
+                "file_path":   meta.get("file_path"),
+                "symbol_name": meta.get("symbol_name"),
+                "chunk_type":  meta.get("chunk_type"),
+                "start_line":  meta.get("start_line"),
+                "end_line":    meta.get("end_line"),
+                "chunk_text":  meta.get("chunk_text"),
+                "intent_meta": {},
+            })
+
+        return results
 
     async def delete_by_file(self, file_path: str) -> int:
-        logger.info("pinecone_delete_stub", file=file_path)
-        return 0
+        """Delete all vectors for a given file path in the namespace."""
+        self._ensure_client()
+
+        try:
+            # Pinecone supports delete by filter
+            self._index.delete(
+                filter={"file_path": {"$eq": file_path}},
+                namespace=self.namespace,
+            )
+            logger.info("pinecone_deleted", file=file_path, namespace=self.namespace)
+            return 1  # Pinecone doesn't return count for filter deletes
+        except Exception as e:
+            logger.error("pinecone_delete_failed", file=file_path, error=str(e))
+            return 0
 
 
 # ── Router ─────────────────────────────────────────────────────────────────────

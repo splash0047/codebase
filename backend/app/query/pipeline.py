@@ -24,6 +24,12 @@ from openai import AsyncOpenAI
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.telemetry import pipeline_span, record_pipeline_metrics, get_tracer
+from app.core.metrics import (
+    record_query_metrics,
+    CACHE_OPS,
+    LLM_SKIPPED_TOTAL,
+)
 from app.db.redis_client import (
     get_cached_result, set_cached_result,
     get_query_frequency, increment_query_frequency,
@@ -170,138 +176,189 @@ class QueryPipeline:
     ) -> QueryResult:
         """
         Full synchronous pipeline — use stream() for SSE streaming.
+        Fully instrumented with OpenTelemetry spans and Prometheus metrics.
         """
-        timer = PipelineTimer()
+        import time as _time
+        _start = _time.monotonic()
 
-        # ── 1. Classify & normalise
-        classifier     = get_classifier()
-        classification = classifier.classify(raw_query, user_intent_override)
-        normalised     = classification.normalised_query
-        timer.mark("classify")
+        tracer = get_tracer()
+        with tracer.start_as_current_span("query_pipeline") as root_span:
+            root_span.set_attribute("query.raw", raw_query[:200])
+            root_span.set_attribute("query.repo_id", self.repo_id)
 
-        # ── 2. Embed query
-        query_vector: list[float] | None = None
-        if not classification.zero_llm_safe:
-            vecs = await _embed_batch_with_fallback([normalised])
-            query_vector = vecs[0] if vecs else None
-        timer.mark("embed")
+            await self.session.load()
+            
+            timer = PipelineTimer()
 
-        # ── 3. Session reset check
-        if self.session.should_reset(normalised, query_vector):
-            self.session.reset()
+            # ── 1. Classify & normalise
+            with pipeline_span("classify", {"query": raw_query[:100]}) as span:
+                classifier     = get_classifier()
+                classification = classifier.classify(raw_query, user_intent_override)
+                normalised     = classification.normalised_query
+                span.set_attribute("intent", classification.intent)
+                span.set_attribute("confidence", classification.confidence)
+                span.set_attribute("zero_llm_safe", classification.zero_llm_safe)
+            timer.mark("classify")
 
-        # ── 4. Cold-query + cache check
-        fingerprint  = await _fingerprint(query_vector, normalised)
-        is_cold      = await _is_cold_query(fingerprint)
-        await increment_query_frequency(fingerprint)
+            # ── 2. Embed query
+            query_vector: list[float] | None = None
+            with pipeline_span("embed_query") as span:
+                if not classification.zero_llm_safe:
+                    vecs = await _embed_batch_with_fallback([normalised])
+                    query_vector = vecs[0] if vecs else None
+                    span.set_attribute("has_vector", query_vector is not None)
+                else:
+                    span.set_attribute("skipped", True)
+            timer.mark("embed")
 
-        if not is_cold and not reproducible:
-            cached = await get_cached_result(f"repo:{self.repo_id}:{fingerprint}")
-            if cached:
-                logger.info("query_cache_hit", fingerprint=fingerprint)
-                return QueryResult(**{**cached, "cached": True})
+            # ── 3. Session reset check
+            if self.session.should_reset(normalised, query_vector):
+                self.session.reset()
 
-        # ── 5. Retrieve
-        timer.mark("retrieve_start")
-        ranked_results = await self.retriever.retrieve(
-            repo_id=self.repo_id,
-            query=normalised,
-            classification=classification,
-            query_vector=query_vector,
-        )
-        timer.mark("retrieve_done")
+            # ── 4. Cold-query + cache check
+            fingerprint  = await _fingerprint(query_vector, normalised)
+            is_cold      = await _is_cold_query(fingerprint)
+            await increment_query_frequency(fingerprint)
 
-        # ── 6. Rank
-        ranked = self.ranker.rank(ranked_results, classification)
+            if not is_cold and not reproducible:
+                cached = await get_cached_result(f"repo:{self.repo_id}:{fingerprint}")
+                if cached:
+                    CACHE_OPS.labels(operation="hit").inc()
+                    logger.info("query_cache_hit", fingerprint=fingerprint)
+                    return QueryResult(**{**cached, "cached": True})
+                CACHE_OPS.labels(operation="miss").inc()
 
-        # ── 7. Non-blocking rerank if confidence is low
-        if ranked and ranked[0].final_score < settings.confidence_refine_threshold:
-            ranked = self.ranker.non_blocking_rerank(ranked, ranked_results, classification)
-
-        confidence_gap = self.ranker.get_confidence_gap(ranked)
-        top_confidence = ranked[0].final_score if ranked else 0.0
-        timer.mark("rank")
-
-        # ── 8. Build context
-        context = build_context(ranked, classification)
-
-        # ── 9. Answer generation
-        answer       = ""
-        zero_llm     = False
-
-        if classification.zero_llm_safe and ranked:
-            answer   = _zero_llm_answer(ranked, raw_query)
-            zero_llm = True
-            timer.mark("zero_llm")
-        elif timer.should_skip_llm():
-            # Priority timeout — return raw structural results
-            answer   = _zero_llm_answer(ranked, raw_query)
-            zero_llm = True
-            logger.warning("llm_skipped_timeout", remaining_ms=timer.remaining_ms())
-            timer.mark("llm_skipped")
-        elif not settings.openai_api_key or not context.chunks:
-            answer = _zero_llm_answer(ranked, raw_query)
-            zero_llm = True
-        else:
-            try:
-                answer = await _call_llm(
-                    raw_query, context, classification,
-                    self.session.get_context_window(),
+            # ── 5. Retrieve
+            with pipeline_span("retrieve", {"repo_id": self.repo_id}) as span:
+                timer.mark("retrieve_start")
+                ranked_results = await self.retriever.retrieve(
+                    repo_id=self.repo_id,
+                    query=normalised,
+                    classification=classification,
+                    query_vector=query_vector,
                 )
-                timer.mark("llm")
-            except asyncio.TimeoutError:
-                answer   = _zero_llm_answer(ranked, raw_query)
+                span.set_attribute("result_count", len(ranked_results))
+            timer.mark("retrieve_done")
+
+            # ── 6. Rank
+            with pipeline_span("rank") as span:
+                ranked = self.ranker.rank(ranked_results, classification)
+
+                # ── 7. Non-blocking rerank if confidence is low
+                if ranked and ranked[0].final_score < settings.confidence_refine_threshold:
+                    ranked = self.ranker.non_blocking_rerank(ranked, ranked_results, classification)
+
+                confidence_gap = self.ranker.get_confidence_gap(ranked)
+                top_confidence = ranked[0].final_score if ranked else 0.0
+                span.set_attribute("top_score", top_confidence)
+                span.set_attribute("confidence_gap", confidence_gap)
+                span.set_attribute("ranked_count", len(ranked))
+            timer.mark("rank")
+
+            # ── 8. Build context
+            with pipeline_span("build_context") as span:
+                context = build_context(ranked, classification)
+                span.set_attribute("total_tokens", context.total_tokens)
+                span.set_attribute("truncated", context.truncated)
+
+            # ── 9. Answer generation
+            answer       = ""
+            zero_llm     = False
+
+            if classification.zero_llm_safe and ranked:
+                with pipeline_span("zero_llm_answer"):
+                    answer   = _zero_llm_answer(ranked, raw_query)
+                    zero_llm = True
+                    LLM_SKIPPED_TOTAL.labels(reason="zero_llm").inc()
+                timer.mark("zero_llm")
+            elif timer.should_skip_llm():
+                with pipeline_span("llm_skipped_timeout"):
+                    answer   = _zero_llm_answer(ranked, raw_query)
+                    zero_llm = True
+                    LLM_SKIPPED_TOTAL.labels(reason="timeout").inc()
+                logger.warning("llm_skipped_timeout", remaining_ms=timer.remaining_ms())
+                timer.mark("llm_skipped")
+            elif not settings.openai_api_key or not context.chunks:
+                answer = _zero_llm_answer(ranked, raw_query)
                 zero_llm = True
-                logger.warning("llm_timeout")
+                LLM_SKIPPED_TOTAL.labels(reason="no_api_key").inc()
+            else:
+                try:
+                    with pipeline_span("llm_call", {"model": "gpt-4o-mini"}):
+                        answer = await _call_llm(
+                            raw_query, context, classification,
+                            self.session.get_context_window(),
+                        )
+                    timer.mark("llm")
+                except asyncio.TimeoutError:
+                    answer   = _zero_llm_answer(ranked, raw_query)
+                    zero_llm = True
+                    LLM_SKIPPED_TOTAL.labels(reason="llm_timeout").inc()
+                    logger.warning("llm_timeout")
 
-        # ── 10. Session update
-        self.session.add(SessionTurn(
-            query=raw_query, normalised=normalised,
-            intent=classification.intent, answer=answer,
-            vector=query_vector,
-        ))
+            # ── 10. Session update
+            self.session.add(SessionTurn(
+                query=raw_query, normalised=normalised,
+                intent=classification.intent, answer=answer,
+                vector=query_vector,
+            ))
+            await self.session.save()
 
-        # ── 11. Answer versioning
-        version = AnswerVersion(
-            query=raw_query, intent=classification.intent,
-            answer=answer,
-            top_node_ids=[r.node.node_id for r in ranked[:5]],
-            confidence=top_confidence,
-            pipeline_ms=timer.summary().get("llm", 0.0),
-        )
-
-        result = QueryResult(
-            answer=answer,
-            intent=classification.intent,
-            confidence=top_confidence,
-            ranked_results=[
-                {
-                    "file":     r.node.file_path,
-                    "symbol":   r.node.symbol_name,
-                    "score":    r.final_score,
-                    "lines":    f"{r.node.start_line}–{r.node.end_line}",
-                    "sources":  r.node.sources,
-                    "gap":      confidence_gap,
-                }
-                for r in ranked[:10]
-            ],
-            context_tokens=context.total_tokens,
-            pipeline_ms=timer.summary(),
-            coverage_warning=context.truncated,
-            zero_llm_mode=zero_llm,
-            version_hash=version.version_hash,
-            confidence_gap=confidence_gap,
-        )
-
-        # ── Cache (skip for cold / reproducible queries)
-        if not is_cold and not reproducible:
-            import dataclasses
-            await set_cached_result(
-                f"repo:{self.repo_id}:{fingerprint}",
-                dataclasses.asdict(result),
+            # ── 11. Answer versioning
+            version = AnswerVersion(
+                query=raw_query, intent=classification.intent,
+                answer=answer,
+                top_node_ids=[r.node.node_id for r in ranked[:5]],
+                confidence=top_confidence,
+                pipeline_ms=timer.summary().get("llm", 0.0),
             )
 
-        return result
+            result = QueryResult(
+                answer=answer,
+                intent=classification.intent,
+                confidence=top_confidence,
+                ranked_results=[
+                    {
+                        "file":     r.node.file_path,
+                        "symbol":   r.node.symbol_name,
+                        "score":    r.final_score,
+                        "lines":    f"{r.node.start_line}–{r.node.end_line}",
+                        "sources":  r.node.sources,
+                        "gap":      confidence_gap,
+                    }
+                    for r in ranked[:10]
+                ],
+                context_tokens=context.total_tokens,
+                pipeline_ms=timer.summary(),
+                coverage_warning=context.truncated,
+                zero_llm_mode=zero_llm,
+                version_hash=version.version_hash,
+                confidence_gap=confidence_gap,
+            )
+
+            # ── Record telemetry & metrics
+            import dataclasses
+            record_pipeline_metrics(root_span, dataclasses.asdict(result))
+
+            total_seconds = _time.monotonic() - _start
+            record_query_metrics(
+                intent=classification.intent,
+                confidence=top_confidence,
+                zero_llm=zero_llm,
+                cached=False,
+                total_seconds=total_seconds,
+                pipeline_ms=timer.summary(),
+            )
+
+            # ── Cache (skip for cold / reproducible queries)
+            if not is_cold and not reproducible:
+                await set_cached_result(
+                    f"repo:{self.repo_id}:{fingerprint}",
+                    dataclasses.asdict(result),
+                )
+                CACHE_OPS.labels(operation="set").inc()
+
+            return result
 
     async def stream(
         self,
@@ -323,6 +380,8 @@ class QueryPipeline:
             classification = classifier.classify(raw_query, user_intent_override)
             vecs           = await _embed_batch_with_fallback([classification.normalised_query])
             query_vector   = vecs[0] if vecs else None
+            
+            await self.session.load()
 
             ranked_nodes = await self.retriever.retrieve(
                 repo_id=self.repo_id,
@@ -361,6 +420,15 @@ class QueryPipeline:
                     for r in ranked[:5]
                 ],
             }
+            
+            # Session update
+            self.session.add(SessionTurn(
+                query=raw_query, normalised=classification.normalised_query,
+                intent=classification.intent, answer=answer,
+                vector=query_vector,
+            ))
+            await self.session.save()
+
             yield _stream_event("complete", payload)
 
         except Exception as exc:

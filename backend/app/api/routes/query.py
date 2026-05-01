@@ -20,14 +20,10 @@ from app.query.pipeline import QueryPipeline, QueryResult
 logger = get_logger(__name__)
 router = APIRouter(prefix="/query", tags=["Query"])
 
-# In-memory session store (per repo_id — replace with Redis in Phase 5)
-_sessions: dict[str, SessionMemory] = {}
-
-
-def _get_session(repo_id: str) -> SessionMemory:
-    if repo_id not in _sessions:
-        _sessions[repo_id] = SessionMemory()
-    return _sessions[repo_id]
+def _get_session(repo_id: str, session_id: str | None = None) -> SessionMemory:
+    """Returns a SessionMemory instance backed by Redis."""
+    sid = session_id or f"default_{repo_id}"
+    return SessionMemory(session_id=sid)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -35,6 +31,7 @@ def _get_session(repo_id: str) -> SessionMemory:
 class QueryRequest(BaseModel):
     query:               str
     repo_id:             str
+    session_id:          str | None = None
     intent_override:     QueryIntent | None = None
     reproducible:        bool = False    # Reproducibility Mode
     zero_llm:            bool = False    # Force Zero-LLM mode
@@ -56,7 +53,7 @@ class FeedbackRequest(BaseModel):
     summary="Submit a synchronous query against an indexed repository",
 )
 async def query(payload: QueryRequest) -> dict:
-    session  = _get_session(payload.repo_id)
+    session  = _get_session(payload.repo_id, payload.session_id)
     pipeline = QueryPipeline(repo_id=payload.repo_id, session=session)
 
     override = payload.intent_override
@@ -105,10 +102,11 @@ async def query(payload: QueryRequest) -> dict:
 async def stream_query(
     repo_id:         str = Query(...),
     query:           str = Query(...),
+    session_id:      str = Query(None),
     intent_override: str = Query(None),
 ) -> StreamingResponse:
     override = QueryIntent(intent_override) if intent_override else None
-    session  = _get_session(repo_id)
+    session  = _get_session(repo_id, session_id)
     pipeline = QueryPipeline(repo_id=repo_id, session=session)
 
     return StreamingResponse(
