@@ -36,7 +36,13 @@ _openai_client: AsyncOpenAI | None = None
 def get_openai_client() -> AsyncOpenAI:
     global _openai_client
     if _openai_client is None:
-        _openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+        if settings.gemini_api_key and not settings.openai_api_key:
+            _openai_client = AsyncOpenAI(
+                api_key=settings.gemini_api_key,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+            )
+        else:
+            _openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
     return _openai_client
 
 
@@ -49,10 +55,16 @@ def get_openai_client() -> AsyncOpenAI:
     reraise=True,
 )
 async def _embed_batch(texts: list[str]) -> list[list[float]]:
-    """Call OpenAI embeddings API for a batch of texts."""
+    """Call OpenAI (or Gemini) embeddings API for a batch of texts."""
     client   = get_openai_client()
+    
+    # Auto-swap to Gemini embedding model if using Gemini
+    model = settings.embedding_model
+    if settings.gemini_api_key and not settings.openai_api_key and model == "text-embedding-3-small":
+        model = "text-embedding-004"
+        
     response = await client.embeddings.create(
-        model=settings.embedding_model,
+        model=model,
         input=texts,
     )
     return [item.embedding for item in response.data]

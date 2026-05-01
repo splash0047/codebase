@@ -28,9 +28,11 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
 
-    # OpenAI
+    # OpenAI / Gemini
     openai_api_key: str = ""
+    gemini_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
+    llm_model: str = "gemini-2.5-flash"
 
     # GitHub
     github_token: str = ""

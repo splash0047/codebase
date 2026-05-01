@@ -93,8 +93,14 @@ async def _call_llm(
     classification: ClassificationResult,
     session_turns: list[dict],
 ) -> str:
-    """Call OpenAI LLM with context. Respects timeout budget."""
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    """Call OpenAI or Gemini LLM with context. Respects timeout budget."""
+    if settings.gemini_api_key and not settings.openai_api_key:
+        client = AsyncOpenAI(
+            api_key=settings.gemini_api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+    else:
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
 
     context_text = "\n\n---\n\n".join(context.chunks)
     system_prompt = (
@@ -114,9 +120,11 @@ async def _call_llm(
         "content": f"Code Context:\n{context_text}\n\nQuestion: {query}",
     })
 
+    model = settings.llm_model if (settings.gemini_api_key and not settings.openai_api_key) else "gpt-4o-mini"
+    
     response = await asyncio.wait_for(
         client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model,
             messages=messages,
             max_tokens=min(1000, settings.max_tokens_absolute // 4),
             temperature=0.2,
@@ -278,13 +286,14 @@ class QueryPipeline:
                     LLM_SKIPPED_TOTAL.labels(reason="timeout").inc()
                 logger.warning("llm_skipped_timeout", remaining_ms=timer.remaining_ms())
                 timer.mark("llm_skipped")
-            elif not settings.openai_api_key or not context.chunks:
+            elif not (settings.openai_api_key or settings.gemini_api_key) or not context.chunks:
                 answer = _zero_llm_answer(ranked, raw_query)
                 zero_llm = True
                 LLM_SKIPPED_TOTAL.labels(reason="no_api_key").inc()
             else:
                 try:
-                    with pipeline_span("llm_call", {"model": "gpt-4o-mini"}):
+                    model_name = settings.llm_model if (settings.gemini_api_key and not settings.openai_api_key) else "gpt-4o-mini"
+                    with pipeline_span("llm_call", {"model": model_name}):
                         answer = await _call_llm(
                             raw_query, context, classification,
                             self.session.get_context_window(),
